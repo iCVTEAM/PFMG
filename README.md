@@ -5,16 +5,6 @@ This repository contains the PyTorch implementation of PFMG, an audio-driven co-
 
 The public release focuses on the PFMG-PAE generation path. Given speech-related conditions and PAE features, the model generates upper-body gesture motion and writes BVH-compatible result files for visualization.
 
-## Release Plans
-
-- [x] PFMG-PAE training code
-- [x] PFMG-PAE inference code
-- [x] BEAT-style dataloader and cache helper
-- [x] Audio2Face training code for producing `face.bin`
-- [x] PFMG-PAE release config and auxiliary checkpoint layout
-- [ ] Public pretrained checkpoint links
-- [ ] Final project page and paper links
-
 ## Contents
 
 - `train.py`, `test.py`: common training and motion-generation entry points.
@@ -40,26 +30,6 @@ If you use local HuggingFace Wav2Vec2 directories, set:
 export PFMG_WAV2VEC2_MODEL=/path/to/wav2vec2-large-xlsr-53-english
 export PFMG_WAV2VEC2_EMOTION_MODEL=/path/to/wav2vec-english-speech-emotion-recognition
 ```
-
-## Download weights
-
-Pretrained weights are not included in git. Please place downloaded checkpoints under:
-
-```text
-./data/beat_cache/beat_4english_15_141/weights/
-```
-
-The main PFMG-PAE path expects:
-
-```text
-face.bin
-pfmg_tcn.bin
-pfmg_tcn_pae.bin
-```
-
-`face.bin` and `pfmg_tcn.bin` are auxiliary checkpoints loaded by the final PFMG-PAE generator.
-
-See `docs/MODEL_ZOO.md` for checkpoint names and download placeholders.
 
 ## Data Preparation
 
