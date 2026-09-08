@@ -1,495 +1,903 @@
+"""PFMG gesture generator with explicit periodic and non-periodic branches.
+
+The non-periodic branch predicts body and hand VQ codes. The periodic branch
+uses predicted phase parameters to blend motion experts. Both branches receive
+the same fused conditions and are added in pose space. Hand generation is
+conditioned on the combined body prediction, following the body-to-hand
+hierarchy described in the paper.
+"""
+
+import math
+import pickle
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-import os
-import pickle
-import numpy as np
-from torch.nn.utils import weight_norm
-from .utils.build_vocab import Vocab
-from torch.nn.parameter import Parameter
 import torch.nn.functional as F
-from .utils import Utility as utility
+from loguru import logger
+from torch.nn.utils import weight_norm
+
 from .audio2face import audio2face
 from .motion_vqvae import VQVAE
-from collections import OrderedDict
-from loguru import logger
-from .pfmg_vqvae import PfMG_VQ
+from .utils.build_vocab import Vocab  # noqa: F401 - needed by legacy vocab.pkl files
 
 
-os.environ['CUDA_LAUNCH_BLOCKING']='1'
+BODY_DIMS = 27
+HAND_DIMS = 114
+POSE_DIMS = BODY_DIMS + HAND_DIMS
 
-def load_checkpoints(model, save_path, load_name='model'):
-    states = torch.load(save_path)
-    new_weights = OrderedDict()
 
-    flag=False
-    for k, v in states['model_state'].items():
-        if "module" not in k:
-            break
-        else:
-            new_weights[k[7:]]=v
-            flag=True
-    if flag: 
-        model.load_state_dict(new_weights, strict=True)
-    else:
-        model.load_state_dict(states['model_state'])
-    logger.info(f"load self-pretrained checkpoints for {load_name}")
+class _LegacyVocabUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "__main__" and name == "Vocab":
+            return Vocab
+        return super().find_class(module, name)
 
-class Model(torch.nn.Module):
-    def __init__(self, gating_indices, gating_input, gating_hidden, gating_output, main_indices, main_input, main_hidden, main_output, dropout, input_norm=None, output_norm=None):
-        super(Model, self).__init__()
 
-        # if len(gating_indices) + len(main_indices) != len(input_norm[0]):
-        #     print("Warning: Number of gating features (" + str(len(gating_indices)) + ") and main features (" + str(len(main_indices)) + ") are not the same as input features (" + str(len(input_norm[0])) + ").")
+def _project_path(root_path, path):
+    """Resolve a config path relative to the repository root."""
+    return Path(str(root_path)) / str(path).lstrip("/")
 
-        self.gating_indices = gating_indices
-        self.main_indices = main_indices
 
-        self.G1 = nn.Linear(gating_input, gating_hidden)
-        self.G2 = nn.Linear(gating_hidden, gating_hidden)
-        self.G3 = nn.Linear(gating_hidden, gating_output)
+def _load_checkpoint(model, checkpoint_path, label):
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Missing {label} checkpoint: {checkpoint_path}. "
+            "Download the pretrained weights before constructing PFMG."
+        )
 
-        self.E1 = ExpertLinear(gating_output, main_input, main_hidden)
-        self.E2 = ExpertLinear(gating_output, main_hidden, main_hidden)
-        self.E3 = ExpertLinear(gating_output, main_hidden, main_output)
+    checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+    state_dict = checkpoint.get("model_state", checkpoint)
+    state_dict = {
+        key[7:] if key.startswith("module.") else key: value
+        for key, value in state_dict.items()
+    }
+    model.load_state_dict(state_dict, strict=True)
+    logger.info(f"Loaded pretrained {label} checkpoint from {checkpoint_path}")
 
-        self.dropout = dropout
-        # self.Xnorm = Parameter(torch.from_numpy(input_norm), requires_grad=False)
-        # self.Ynorm = Parameter(torch.from_numpy(output_norm), requires_grad=False)
 
-    def forward(self, x):
-        # x = utility.Normalize(x, self.Xnorm)
+def _freeze(module):
+    module.eval()
+    for parameter in module.parameters():
+        parameter.requires_grad = False
 
-        #Gating
-        # print(x.shape, self.gating_indices[-1])
-        g = x[:, :, self.gating_indices]
-        g = F.dropout(g, self.dropout, training=self.training)
-        g = self.G1(g)
-        g = F.elu(g)
-
-        g = F.dropout(g, self.dropout, training=self.training)
-        g = self.G2(g)
-        g = F.elu(g)
-
-        g = F.dropout(g, self.dropout, training=self.training)
-        g = self.G3(g)
-
-        w = F.softmax(g, dim=1)
-        #Main
-        m = x[:, :, self.main_indices]
-
-        m = F.dropout(m, self.dropout, training=self.training)
-        m = self.E1(m, w)
-        m = F.elu(m)
-
-        m = F.dropout(m, self.dropout, training=self.training)
-        m = self.E2(m , w)
-        m = F.elu(m)
-
-        m = F.dropout(m, self.dropout, training=self.training)
-        m = self.E3(m, w)
-
-        # return utility.Renormalize(m, self.Ynorm), w
-        return m, w
-    
-class ExpertLinear(torch.nn.Module):
-    def __init__(self, experts, input_dim, output_dim):
-        super(ExpertLinear, self).__init__()
-
-        self.experts = experts
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.W = self.weights([experts, input_dim, output_dim])
-        self.b = self.bias([experts, 1, output_dim])
-
-    def forward(self, x, weights):
-        y = torch.zeros((x.shape[0], x.shape[1], self.output_dim), device=x.device, requires_grad=True)
-        for i in range(self.experts):
-            y = y + weights[:, :, i].unsqueeze(2) * (x.matmul(self.W[i,:,:]) + self.b[i,:,:])
-        return y
-
-    def weights(self, shape):
-        alpha_bound = np.sqrt(6.0 / np.prod(shape[-2:]))
-        alpha = np.asarray(np.random.uniform(low=-alpha_bound, high=alpha_bound, size=shape), dtype=np.float32)
-        return Parameter(torch.from_numpy(alpha), requires_grad=True)
-
-    def bias(self, shape):
-        return Parameter(torch.zeros(shape, dtype=torch.float), requires_grad=True)
 
 class Chomp1d(nn.Module):
     def __init__(self, chomp_size):
-        super(Chomp1d, self).__init__()
+        super().__init__()
         self.chomp_size = chomp_size
 
-    def forward(self, x):
-        return x[:, :, :-self.chomp_size].contiguous()
+    def forward(self, inputs):
+        return inputs[:, :, :-self.chomp_size].contiguous()
 
 
 class TemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
-        super(TemporalBlock, self).__init__()
-        self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation))
-        self.chomp1 = Chomp1d(padding)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        dilation,
+        dropout,
+    ):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.network = nn.Sequential(
+            weight_norm(
+                nn.Conv1d(
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    padding=padding,
+                    dilation=dilation,
+                )
+            ),
+            Chomp1d(padding),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            weight_norm(
+                nn.Conv1d(
+                    out_channels,
+                    out_channels,
+                    kernel_size,
+                    padding=padding,
+                    dilation=dilation,
+                )
+            ),
+            Chomp1d(padding),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.residual = (
+            nn.Conv1d(in_channels, out_channels, 1)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+        self.activation = nn.ReLU()
+        self._reset_parameters()
 
-        self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation))
-        self.chomp2 = Chomp1d(padding)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
+    def _reset_parameters(self):
+        for module in self.network:
+            if isinstance(module, nn.Conv1d):
+                module.weight.data.normal_(0, 0.01)
+        if isinstance(self.residual, nn.Conv1d):
+            self.residual.weight.data.normal_(0, 0.01)
 
-        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
-                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
-        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
-        self.relu = nn.ReLU()
-        self.init_weights()
-
-    def init_weights(self):
-        self.conv1.weight.data.normal_(0, 0.01)
-        self.conv2.weight.data.normal_(0, 0.01)
-        if self.downsample is not None:
-            self.downsample.weight.data.normal_(0, 0.01)
-
-    def forward(self, x):
-        out = self.net(x)
-        res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
+    def forward(self, inputs):
+        return self.activation(self.network(inputs) + self.residual(inputs))
 
 
 class TemporalConvNet(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
-        super(TemporalConvNet, self).__init__()
-        layers = []
-        num_levels = len(num_channels)
-        for i in range(num_levels):
-            dilation_size = 2 ** i
-            in_channels = num_inputs if i == 0 else num_channels[i-1]
-            out_channels = num_channels[i]
-            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
-                                     padding=(kernel_size-1) * dilation_size, dropout=dropout)]
+    def __init__(self, in_channels, channels, kernel_size=2, dropout=0.2):
+        super().__init__()
+        blocks = []
+        for level, out_channels in enumerate(channels):
+            block_in = in_channels if level == 0 else channels[level - 1]
+            blocks.append(
+                TemporalBlock(
+                    block_in,
+                    out_channels,
+                    kernel_size,
+                    dilation=2**level,
+                    dropout=dropout,
+                )
+            )
+        self.network = nn.Sequential(*blocks)
 
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.network(x)
+    def forward(self, inputs):
+        return self.network(inputs)
 
 
 class TextEncoderTCN(nn.Module):
-    """ based on https://github.com/locuslab/TCN/blob/master/TCN/word_cnn/model.py """
-    def __init__(self, args, n_words, embed_size=300, pre_trained_embedding=None,
-                 kernel_size=2, dropout=0.3, emb_dropout=0.1):
-        super(TextEncoderTCN, self).__init__()
-
-        if pre_trained_embedding is not None:  # use pre-trained embedding (fasttext)
-            #print(pre_trained_embedding.shape)
-            assert pre_trained_embedding.shape[0] == n_words
-            assert pre_trained_embedding.shape[1] == embed_size
-            self.embedding = nn.Embedding.from_pretrained(torch.FloatTensor(pre_trained_embedding),
-                                                          freeze=args.freeze_wordembed)
+    def __init__(
+        self,
+        args,
+        n_words,
+        embedding_size=300,
+        pretrained_embedding=None,
+        kernel_size=2,
+        dropout=0.3,
+        embedding_dropout=0.1,
+    ):
+        super().__init__()
+        if pretrained_embedding is not None:
+            if pretrained_embedding.shape != (n_words, embedding_size):
+                raise ValueError(
+                    "Unexpected word embedding shape: "
+                    f"{pretrained_embedding.shape}, expected {(n_words, embedding_size)}"
+                )
+            self.embedding = nn.Embedding.from_pretrained(
+                torch.as_tensor(pretrained_embedding, dtype=torch.float32),
+                freeze=args.freeze_wordembed,
+            )
         else:
-            self.embedding = nn.Embedding(n_words, embed_size)
+            self.embedding = nn.Embedding(n_words, embedding_size)
 
-        num_channels = [args.hidden_size] * args.n_layer
-        self.tcn = TemporalConvNet(embed_size, num_channels, kernel_size, dropout=dropout)
+        self.embedding_dropout = nn.Dropout(embedding_dropout)
+        self.tcn = TemporalConvNet(
+            embedding_size,
+            [args.hidden_size] * args.n_layer,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
+        self.output = nn.Linear(args.hidden_size, args.word_f)
+        nn.init.zeros_(self.output.bias)
+        nn.init.normal_(self.output.weight, 0, 0.01)
 
-        self.decoder = nn.Linear(num_channels[-1], args.word_f)
-        self.drop = nn.Dropout(emb_dropout)
-        self.emb_dropout = emb_dropout
-        self.init_weights()
-
-    def init_weights(self):
-        self.decoder.bias.data.fill_(0)
-        self.decoder.weight.data.normal_(0, 0.01)
-
-    def forward(self, input):
-        emb = self.drop(self.embedding(input))
-        y = self.tcn(emb.transpose(1, 2)).transpose(1, 2)
-        y = self.decoder(y)
-        return y.contiguous(), 0
+    def forward(self, token_ids):
+        embedded = self.embedding_dropout(self.embedding(token_ids))
+        encoded = self.tcn(embedded.transpose(1, 2)).transpose(1, 2)
+        return self.output(encoded).contiguous(), None
 
 
 class BasicBlock(nn.Module):
-    """ based on timm: https://github.com/rwightman/pytorch-image-models """
-    def __init__(self, inplanes, planes, ker_size, stride=1, downsample=None, cardinality=1, base_width=64,
-                 reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.LeakyReLU,   norm_layer=nn.BatchNorm1d, attn_layer=None, aa_layer=None, drop_block=None, drop_path=None):
-        super(BasicBlock, self).__init__()
-
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        first_padding,
+        downsample=False,
+    ):
+        super().__init__()
         self.conv1 = nn.Conv1d(
-            inplanes, planes, kernel_size=ker_size, stride=stride, padding=first_dilation,
-            dilation=dilation, bias=True)
-        self.bn1 = norm_layer(planes)
-        self.act1 = act_layer(inplace=True)
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=first_padding,
+            bias=True,
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.act1 = nn.LeakyReLU(inplace=True)
         self.conv2 = nn.Conv1d(
-            planes, planes, kernel_size=ker_size, padding=ker_size//2, dilation=dilation, bias=True)
-        self.bn2 = norm_layer(planes)
-        self.act2 = act_layer(inplace=True)
-        if downsample is not None:
+            out_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            bias=True,
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.act2 = nn.LeakyReLU(inplace=True)
+        self.downsample = None
+        if downsample:
             self.downsample = nn.Sequential(
-                nn.Conv1d(inplanes, planes,  stride=stride, kernel_size=ker_size, padding=first_dilation, dilation=dilation, bias=True),
-                norm_layer(planes), 
+                nn.Conv1d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=kernel_size,
+                    padding=first_padding,
+                    bias=True,
+                ),
+                nn.BatchNorm1d(out_channels),
             )
-        else: self.downsample=None
-        self.stride = stride
-        self.dilation = dilation
-        self.drop_block = drop_block
-        self.drop_path = drop_path
 
-    def zero_init_last_bn(self):
-        nn.init.zeros_(self.bn2.weight)
-
-    def forward(self, x):
-        shortcut = x
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.act1(x)
-        x = self.conv2(x)
-        x = self.bn2(x)
-        if self.downsample is not None:
-            shortcut = self.downsample(shortcut)
-        x += shortcut
-        x = self.act2(x)
-        return x
+    def forward(self, inputs):
+        residual = inputs if self.downsample is None else self.downsample(inputs)
+        hidden = self.act1(self.bn1(self.conv1(inputs)))
+        hidden = self.bn2(self.conv2(hidden))
+        return self.act2(hidden + residual)
 
 
-class WavEncoder(nn.Module):
-    def __init__(self, out_dim):
-        super().__init__() 
-        self.out_dim = out_dim
-        self.feat_extractor = nn.Sequential( 
-                BasicBlock(1, 32, 15, 5, first_dilation=1600, downsample=True),
-                BasicBlock(32, 32, 15, 6, first_dilation=0, downsample=True),
-                BasicBlock(32, 32, 15, 1, first_dilation=7, ),
-                BasicBlock(32, 64, 15, 6, first_dilation=0, downsample=True),
-                BasicBlock(64, 64, 15, 1, first_dilation=7),
-                BasicBlock(64, 128, 15, 6,  first_dilation=0,downsample=True),     
+class ExpertLinear(nn.Module):
+    """A linear layer whose expert outputs are blended per frame."""
+
+    def __init__(self, experts, in_features, out_features):
+        super().__init__()
+        self.experts = experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(experts, in_features, out_features))
+        self.bias = nn.Parameter(torch.empty(experts, out_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for expert_weight in self.weight:
+            nn.init.kaiming_uniform_(expert_weight, a=math.sqrt(5))
+        bound = 1 / math.sqrt(self.in_features)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, inputs, expert_weights):
+        if inputs.shape[:-1] != expert_weights.shape[:-1]:
+            raise ValueError(
+                "Expert input and gating weights must share batch/time dimensions: "
+                f"{inputs.shape} vs. {expert_weights.shape}"
             )
-        
-    def forward(self, wav_data):
-        wav_data = wav_data.unsqueeze(1) 
-        out = self.feat_extractor(wav_data)
-        return out.transpose(1, 2) 
+        if inputs.shape[-1] != self.in_features:
+            raise ValueError(
+                f"Expected {self.in_features} expert features, got {inputs.shape[-1]}"
+            )
+        if expert_weights.shape[-1] != self.experts:
+            raise ValueError(
+                f"Expected {self.experts} expert weights, got {expert_weights.shape[-1]}"
+            )
+
+        outputs = torch.einsum("bti,eio->bteo", inputs, self.weight)
+        outputs = outputs + self.bias.view(1, 1, self.experts, self.out_features)
+        return torch.sum(outputs * expert_weights.unsqueeze(-1), dim=2)
 
 
-class PoseGenerator(nn.Module):
-    """
-    End2End model
-    audio, text and speaker ID encoder are customized based on Yoon et al. SIGGRAPH ASIA 2020
-    """
+class PhaseConditionedMoE(nn.Module):
+    """Weight-blended experts gated by phase shifts, not by the time axis."""
+
+    def __init__(
+        self,
+        feature_dim,
+        phase_dim,
+        output_dim,
+        experts=5,
+        gating_hidden=64,
+        expert_hidden=1024,
+        dropout=0.3,
+    ):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.phase_dim = phase_dim
+        self.output_dim = output_dim
+        self.dropout = dropout
+
+        self.gating = nn.Sequential(
+            nn.Linear(phase_dim, gating_hidden),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(gating_hidden, gating_hidden),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(gating_hidden, experts),
+        )
+        self.expert1 = ExpertLinear(experts, feature_dim, expert_hidden)
+        self.expert2 = ExpertLinear(experts, expert_hidden, expert_hidden)
+        self.expert3 = ExpertLinear(experts, expert_hidden, output_dim)
+
+    def forward(self, features, phase_shift):
+        if features.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"Expected periodic feature dim {self.feature_dim}, "
+                f"got {features.shape[-1]}"
+            )
+        if phase_shift.shape[-1] != self.phase_dim:
+            raise ValueError(
+                f"Expected phase dim {self.phase_dim}, got {phase_shift.shape[-1]}"
+            )
+        if features.shape[:2] != phase_shift.shape[:2]:
+            raise ValueError(
+                "Periodic features and phase shifts must share batch/time dimensions"
+            )
+
+        expert_weights = F.softmax(self.gating(phase_shift), dim=-1)
+        hidden = F.dropout(features, self.dropout, training=self.training)
+        hidden = F.elu(self.expert1(hidden, expert_weights))
+        hidden = F.dropout(hidden, self.dropout, training=self.training)
+        hidden = F.elu(self.expert2(hidden, expert_weights))
+        hidden = F.dropout(hidden, self.dropout, training=self.training)
+        return self.expert3(hidden, expert_weights), expert_weights
+
+
+class PfMG_VQ_PAE(nn.Module):
+    """Hierarchical PFMG variant with VQ non-periodic generators."""
+
     def __init__(self, args):
         super().__init__()
-        self.pre_length = args.pre_frames 
-        self.gen_length = args.pose_length - args.pre_frames
-        self.pose_dims = args.pose_dims
-        self.facial_f = args.facial_f
-        self.speaker_f = args.speaker_f
-        self.audio_f = args.audio_f
-        self.word_f = args.word_f
-        self.emotion_f = args.emotion_f
-        # self.mfcc_f = args.mfcc_f
-        self.facial_dims = args.facial_dims
-        self.speaker_dims = args.speaker_dims
-        self.emotion_dims = args.emotion_dims
-        self.in_size = self.audio_f + self.pose_dims + self.facial_f + self.word_f + 1
+        self.args = args
+        self.pose_dims = int(args.pose_dims)
+        self.pose_length = int(args.pose_length)
+        self.seed_dim = self.pose_dims + 1
+        self.audio_f = int(args.audio_f)
+        self.facial_f = int(args.facial_f)
+        self.word_f = int(args.word_f)
+        self.speaker_f = int(args.speaker_f)
+        self.emotion_f = int(args.emotion_f)
+        self.hidden_size = int(args.hidden_size)
+        self.n_layer = int(args.n_layer)
 
-        self.vqvae_pose = PfMG_VQ(args)
-        model_path = args.root_path + '/data/beat_cache/beat_4english_15_141/weights/vqvae.bin'
-        load_checkpoints(self.vqvae_pose, model_path, 'vqvae')
-        for param in self.vqvae_pose.parameters():
-            param.requires_grad=False
-        
-        self.hidden_size = 256
-        self.n_layer = args.n_layer
-        
-        gating_indices = torch.tensor([(617 + i) for i in range(10)])
-        main_indices = torch.tensor([(0 + i) for i in range(617)])
-        dropout = 0.3
-        gating_hidden = 64
-        main_hidden = 1024
-        experts = 5
-        output_dim = 27
-        
-        self.body_GNN = utility.ToDevice(Model(
-                gating_indices=gating_indices, 
-                gating_input=len(gating_indices), 
-                gating_hidden=gating_hidden, 
-                gating_output=experts, 
-                main_indices=main_indices, 
-                main_input=len(main_indices), 
-                main_hidden=main_hidden, 
-                main_output=output_dim,
-                dropout=dropout
-            ))
-        
-        self.batch=256
-        self.width=64
+        phase_channels = float(args.embedding_channels)
+        if not phase_channels.is_integer() or phase_channels <= 0:
+            raise ValueError("embedding_channels must be a positive integer")
+        self.phase_channels = int(phase_channels)
+        self.phase_parameter_dim = 4 * self.phase_channels
+        self.periodic_descriptor_dim = 3 * self.phase_channels
 
-        self.LSTM = nn.LSTM(self.in_size, hidden_size=self.hidden_size, num_layers=args.n_layer, batch_first=True,
-                          bidirectional=True, dropout=args.dropout_prob)
+        if self.pose_dims != POSE_DIMS:
+            raise ValueError(
+                f"PFMG uses 27 body + 114 hand dimensions; got pose_dims={self.pose_dims}"
+            )
+        self.latent_steps = self.pose_length // 4
+        if self.latent_steps * 4 + 2 != self.pose_length:
+            raise ValueError(
+                "The released VQ decoder requires pose_length = 4 * latent_steps + 2; "
+                f"got pose_length={self.pose_length}"
+            )
 
-        gating_indices = torch.tensor([(617 + i) for i in range(10)])
-        main_indices = torch.tensor([(0 + i) for i in range(617)])
-        dropout = 0.3
-        gating_hidden = 64
-        main_hidden = 1024
-        experts = 5
-        output_dim = 114
-        
-        self.hand_GNN = utility.ToDevice(Model(
-                gating_indices=gating_indices, 
-                gating_input=len(gating_indices), 
-                gating_hidden=gating_hidden, 
-                gating_output=experts, 
-                main_indices=main_indices, 
-                main_input=len(main_indices), 
-                main_hidden=main_hidden, 
-                main_output=output_dim,
-                dropout=dropout
-            ))
+        self.audio2face = audio2face(args)
+        audio_encoder = self.audio2face.audio_encoder
+        content_projection = getattr(audio_encoder, "audio_feature_map_cont", None)
+        emotion_projection = getattr(audio_encoder, "audio_feature_map_emo2", None)
+        if content_projection is None or emotion_projection is None:
+            raise ValueError("Unsupported Audio2Face encoder: output dimensions are unavailable")
+        self.raw_audio_dim = (
+            content_projection.out_features + emotion_projection.out_features
+        )
+        if self.audio_f != self.raw_audio_dim:
+            raise ValueError(
+                "audio_f must match the concatenated Audio2Face content/emotion features: "
+                f"expected {self.raw_audio_dim}, got {self.audio_f}"
+            )
+        if self.emotion_f != 8:
+            raise ValueError(
+                "The released Audio2Face decoder expects emotion_f=8; "
+                f"got {self.emotion_f}"
+            )
 
-        self.LSTM_hands = nn.LSTM(self.in_size+27, hidden_size=self.hidden_size, num_layers=args.n_layer, batch_first=True,
-                          bidirectional=True, dropout=args.dropout_prob)
+        self.facial_encoder = nn.Sequential(
+            BasicBlock(args.facial_dims, self.facial_f // 2, 7, 3, downsample=True),
+            BasicBlock(self.facial_f // 2, self.facial_f // 2, 3, 1, downsample=True),
+            BasicBlock(self.facial_f // 2, self.facial_f // 2, 3, 1),
+            BasicBlock(self.facial_f // 2, self.facial_f, 3, 1, downsample=True),
+        )
 
-        self.do_flatten_parameters = False
-        if torch.cuda.device_count() > 1:
-            self.do_flatten_parameters = True
-            
+        self.text_encoder = None
+        if self.word_f:
+            train_dir = _project_path(args.root_path, args.train_data_path)
+            vocab_path = train_dir.parent / "vocab.pkl"
+            if not vocab_path.is_file():
+                raise FileNotFoundError(f"Missing vocabulary: {vocab_path}")
+            with vocab_path.open("rb") as vocab_file:
+                language_model = _LegacyVocabUnpickler(vocab_file).load()
+            self.text_encoder = TextEncoderTCN(
+                args,
+                args.word_index_num,
+                args.word_dims,
+                pretrained_embedding=language_model.word_embedding_weights,
+                dropout=args.dropout_prob,
+            )
 
-    def forward(self, pre_seq, in_audio=None, in_facial=None, in_text=None, in_id=None, in_emo=None, is_test=False):
-        if self.do_flatten_parameters:
-            self.LSTM.flatten_parameters()
+        self.speaker_embedding = None
+        if self.speaker_f:
+            self.speaker_embedding = nn.Sequential(
+                nn.Embedding(args.speaker_dims, self.speaker_f),
+                nn.Linear(self.speaker_f, self.speaker_f),
+                nn.LeakyReLU(inplace=True),
+            )
 
-        text_feat_seq = audio_feat_seq = None
-        if in_audio is not None:
-            audio_feat_seq = self.audio_encoder(in_audio) 
-        if in_text is not None:
-            text_feat_seq, _ = self.text_encoder(in_text)
-            assert(audio_feat_seq.shape[1] == text_feat_seq.shape[1])
-        
-        if self.facial_f != 0:
-            face_feat_seq = self.facial_encoder(in_facial.permute([0, 2, 1]))
-            face_feat_seq = face_feat_seq.permute([0, 2, 1])
+        self.emotion_embedding = nn.Sequential(
+            nn.Embedding(args.emotion_dims, self.emotion_f),
+            nn.Linear(self.emotion_f, self.emotion_f),
+        )
+        self.emotion_embedding_tail = nn.Sequential(
+            nn.Conv1d(self.emotion_f, 8, 9, padding=4),
+            nn.BatchNorm1d(8),
+            nn.LeakyReLU(0.3, inplace=True),
+            nn.Conv1d(8, 16, 9, padding=4),
+            nn.BatchNorm1d(16),
+            nn.LeakyReLU(0.3, inplace=True),
+            nn.Conv1d(16, 16, 9, padding=4),
+            nn.BatchNorm1d(16),
+            nn.LeakyReLU(0.3, inplace=True),
+            nn.Conv1d(16, self.emotion_f, 9, padding=4),
+            nn.BatchNorm1d(self.emotion_f),
+            nn.LeakyReLU(0.3, inplace=True),
+        )
 
-        speaker_feat_seq = None
-        if self.speaker_embedding: 
-            speaker_feat_seq = self.speaker_embedding(in_id)
-
-        emo_feat_seq = None
-        if self.emotion_embedding:
-            emo_feat_seq = self.emotion_embedding(in_emo)
-            emo_feat_seq = emo_feat_seq.permute([0,2,1])
-            emo_feat_seq = self.emotion_embedding_tail(emo_feat_seq) 
-            emo_feat_seq = emo_feat_seq.permute([0,2,1])
-
-        if  audio_feat_seq.shape[1] != pre_seq.shape[1]:
-            diff_length = pre_seq.shape[1] - audio_feat_seq.shape[1]
-            audio_feat_seq = torch.cat((audio_feat_seq, audio_feat_seq[:,-diff_length:, :].reshape(1,diff_length,-1)),1)
-       
-        if self.audio_f != 0 and self.facial_f == 0:
-            in_data = torch.cat((pre_seq, audio_feat_seq), dim=2)
-        elif self.audio_f != 0 and self.facial_f != 0:
-            in_data = torch.cat((pre_seq, audio_feat_seq, face_feat_seq), dim=2)
-        else: pass
-        
-        if text_feat_seq is not None:
-            in_data = torch.cat((in_data, text_feat_seq), dim=2)
-        if emo_feat_seq is not None:
-            in_data = torch.cat((in_data, emo_feat_seq), dim=2)
-        
-        if speaker_feat_seq is not None:
-            repeated_s = speaker_feat_seq
-            if len(repeated_s.shape) == 2:
-                repeated_s = repeated_s.reshape(1, repeated_s.shape[1], repeated_s.shape[0])
-            repeated_s = repeated_s.repeat(1, in_data.shape[1], 1)
-            in_data = torch.cat((in_data, repeated_s), dim=2)
-        
-        output, _ = self.LSTM(in_data)
-        output = output[:, :, :self.hidden_size] + output[:, :, self.hidden_size:] 
-        output = self.out(output.reshape(-1, output.shape[2]))
-        decoder_outputs = output.reshape(in_data.shape[0], in_data.shape[1], -1)
-        return decoder_outputs
-    
-
-class PfMG_VQ_PAE(PoseGenerator):
-    def __init__(self, args):
-        super().__init__(args)
-        self.args = args 
-        self.audio_fusion_dim = self.audio_f+self.speaker_f+self.emotion_f+self.word_f
-        self.facial_fusion_dim = self.audio_fusion_dim + self.facial_f
+        self.audio_fusion_input_dim = (
+            self.raw_audio_dim + self.word_f + self.emotion_f + self.speaker_f
+        )
         self.audio_fusion = nn.Sequential(
-            nn.Linear(self.audio_fusion_dim, self.hidden_size//2),
-            nn.LeakyReLU(True),
-            nn.Linear(self.hidden_size//2, self.audio_f),
-            nn.LeakyReLU(True),
+            nn.Linear(self.audio_fusion_input_dim, self.hidden_size // 2),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(self.hidden_size // 2, self.audio_f),
+            nn.LeakyReLU(inplace=True),
         )
-        
+        self.facial_fusion_input_dim = (
+            self.facial_f
+            + self.audio_f
+            + self.word_f
+            + self.emotion_f
+            + self.speaker_f
+        )
         self.facial_fusion = nn.Sequential(
-            nn.Linear(self.facial_fusion_dim, self.hidden_size//2),
-            nn.LeakyReLU(True),
-            nn.Linear(self.hidden_size//2, self.facial_f),
-            nn.LeakyReLU(True),
+            nn.Linear(self.facial_fusion_input_dim, self.hidden_size // 2),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(self.hidden_size // 2, self.facial_f),
+            nn.LeakyReLU(inplace=True),
         )
-        
-    def forward(self, pre_seq, in_audio=None, in_facial=None, in_pae=None, in_text=None, in_id=None, in_emo=None, in_pose=None):
-        if self.do_flatten_parameters:
-            self.LSTM.flatten_parameters()
 
-        self.vqvae_pose.eval()
-        decoder_outputs_iperiod, _, _, _, _, in_data= self.vqvae_pose(pre_seq, in_audio, in_facial, in_pae, in_text, in_id, in_emo, in_pose)
+        self.condition_dim = (
+            self.speaker_f
+            + self.emotion_f
+            + self.word_f
+            + self.audio_f
+            + self.facial_f
+        )
+        self.feature_fusion_lstm = nn.LSTM(
+            self.condition_dim,
+            self.hidden_size,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.feature_fusion_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(self.hidden_size, self.condition_dim),
+        )
+        self.generator_context_dim = self.seed_dim + self.condition_dim
 
-        hidden_data = torch.cat((decoder_outputs_iperiod, in_data), dim=2)
+        self.body_vqvae = VQVAE(args, BODY_DIMS)
+        self.hand_vqvae = VQVAE(args, HAND_DIMS)
 
-        decoder_outputs_period, _ = self.body_GNN(hidden_data)
-        decoder_outputs_iperiod[:, :, 0:18] = decoder_outputs_iperiod[:, :, 0:18] + decoder_outputs_period[:, :, 0:18]
-        decoder_outputs_iperiod[:, :, 75:84] = decoder_outputs_iperiod[:, :, 75:84] + decoder_outputs_period[:, :, 18:27]
+        lstm_dropout = args.dropout_prob if self.n_layer > 1 else 0.0
+        self.body_lstm = nn.LSTM(
+            self.generator_context_dim,
+            self.hidden_size,
+            num_layers=self.n_layer,
+            batch_first=True,
+            bidirectional=True,
+            dropout=lstm_dropout,
+        )
+        self.body_code_head = nn.Linear(
+            self.hidden_size, self.body_vqvae.num_embeddings
+        )
 
-        hidden_data = torch.cat((decoder_outputs_iperiod, in_data), dim=2)
-        decoder_outputs_period, _ = self.hand_GNN(hidden_data)
-        decoder_outputs_iperiod[:, :, 18:75] = decoder_outputs_iperiod[:, :, 18:75] + decoder_outputs_period[:, :, 0:57]
-        decoder_outputs_iperiod[:, :, 84:141] = decoder_outputs_iperiod[:, :, 84:141] + decoder_outputs_period[:, :, 57:114]
+        self.hand_context_dim = self.generator_context_dim + BODY_DIMS
+        self.hand_lstm = nn.LSTM(
+            self.hand_context_dim,
+            self.hidden_size,
+            num_layers=self.n_layer,
+            batch_first=True,
+            bidirectional=True,
+            dropout=lstm_dropout,
+        )
+        self.hand_code_head = nn.Linear(
+            self.hidden_size, self.hand_vqvae.num_embeddings
+        )
 
-        decoder_outputs_final = decoder_outputs_iperiod
+        self.phase_lstm = nn.LSTM(
+            self.generator_context_dim,
+            self.hidden_size,
+            num_layers=self.n_layer,
+            batch_first=True,
+            bidirectional=True,
+            dropout=lstm_dropout,
+        )
+        self.phase_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(self.hidden_size // 2, self.phase_parameter_dim),
+        )
 
-        return decoder_outputs_final
+        moe_experts = int(getattr(args, "moe_experts", 5))
+        moe_hidden = int(getattr(args, "moe_hidden_size", 1024))
+        moe_dropout = float(getattr(args, "moe_dropout", 0.3))
+        self.body_periodic = PhaseConditionedMoE(
+            self.generator_context_dim + self.periodic_descriptor_dim,
+            self.phase_channels,
+            BODY_DIMS,
+            experts=moe_experts,
+            expert_hidden=moe_hidden,
+            dropout=moe_dropout,
+        )
+        self.hand_periodic = PhaseConditionedMoE(
+            self.hand_context_dim + self.periodic_descriptor_dim,
+            self.phase_channels,
+            HAND_DIMS,
+            experts=moe_experts,
+            expert_hidden=moe_hidden,
+            dropout=moe_dropout,
+        )
 
-    
+        self.vq_temperature = float(getattr(args, "vq_temperature", 1.0))
+        if self.vq_temperature <= 0:
+            raise ValueError("vq_temperature must be positive")
+
+        if getattr(args, "load_pretrained", True):
+            weights_dir = _project_path(args.root_path, args.train_data_path).parent / "weights"
+            _load_checkpoint(self.audio2face, weights_dir / "face.bin", "face")
+            _load_checkpoint(self.body_vqvae, weights_dir / "b_vqvae.bin", "body VQ-VAE")
+            _load_checkpoint(self.hand_vqvae, weights_dir / "h_vqvae.bin", "hand VQ-VAE")
+
+        _freeze(self.audio2face)
+        _freeze(self.body_vqvae)
+        _freeze(self.hand_vqvae)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.audio2face.eval()
+        self.body_vqvae.eval()
+        self.hand_vqvae.eval()
+        return self
+
+    @staticmethod
+    def _align_time(features, time_steps, name):
+        if features.ndim != 3:
+            raise ValueError(f"{name} must have shape [B, T, C], got {features.shape}")
+        if features.shape[1] == time_steps:
+            return features
+        if features.shape[1] <= 0:
+            raise ValueError(f"{name} has an empty time dimension")
+        return F.interpolate(
+            features.transpose(1, 2),
+            size=time_steps,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
+
+    @staticmethod
+    def _normalise_labels(labels, batch_size, time_steps, name, constant=False):
+        if labels is None:
+            raise ValueError(f"{name} is required by the current configuration")
+        while labels.ndim > 2 and labels.shape[-1] == 1:
+            labels = labels.squeeze(-1)
+        if labels.ndim == 1:
+            if labels.shape[0] == batch_size:
+                labels = labels.unsqueeze(1)
+            elif batch_size == 1:
+                labels = labels.unsqueeze(0)
+        if labels.ndim != 2 or labels.shape[0] != batch_size:
+            raise ValueError(
+                f"{name} must have shape [B], [B, 1], or [B, T], got {labels.shape}"
+            )
+        labels = labels.long()
+        if constant:
+            return labels[:, :1]
+        if labels.shape[1] == time_steps:
+            return labels
+        if labels.shape[1] == 1:
+            return labels.expand(-1, time_steps)
+        indices = torch.linspace(
+            0,
+            labels.shape[1] - 1,
+            time_steps,
+            device=labels.device,
+        ).round().long()
+        return labels.index_select(1, indices)
+
+    @staticmethod
+    def _sum_bidirectional(output, hidden_size):
+        if output.shape[-1] != 2 * hidden_size:
+            raise RuntimeError(
+                f"Expected bidirectional LSTM dim {2 * hidden_size}, got {output.shape[-1]}"
+            )
+        return output[..., :hidden_size] + output[..., hidden_size:]
+
+    def _encode_conditions(self, pre_seq, in_audio, in_text, in_id, in_emo):
+        batch_size, time_steps, _ = pre_seq.shape
+        if in_audio is None or in_audio.ndim != 2 or in_audio.shape[0] != batch_size:
+            shape = None if in_audio is None else tuple(in_audio.shape)
+            raise ValueError(f"in_audio must have shape [B, samples], got {shape}")
+
+        speaker_labels = None
+        if self.speaker_f:
+            speaker_labels = self._normalise_labels(
+                in_id, batch_size, time_steps, "in_id", constant=True
+            )
+        emotion_labels = self._normalise_labels(
+            in_emo, batch_size, time_steps, "in_emo"
+        )
+        token_ids = None
+        if self.word_f:
+            token_ids = self._normalise_labels(
+                in_text, batch_size, time_steps, "in_text"
+            )
+
+        audio_encoder = self.audio2face.audio_encoder
+        if hasattr(audio_encoder, "device"):
+            audio_encoder.device = in_audio.device
+        with torch.no_grad():
+            predicted_face, content_audio, emotion_audio = self.audio2face(
+                in_audio=in_audio,
+                in_text=token_ids,
+                in_id=speaker_labels,
+                in_emo=emotion_labels,
+            )
+
+        predicted_face = self._align_time(predicted_face, time_steps, "predicted face")
+        content_audio = self._align_time(content_audio, time_steps, "content audio")
+        emotion_audio = self._align_time(emotion_audio, time_steps, "emotion audio")
+        if predicted_face.shape[-1] != self.args.facial_dims:
+            raise RuntimeError(
+                f"Audio2Face produced {predicted_face.shape[-1]} face dims; "
+                f"expected {self.args.facial_dims}"
+            )
+
+        raw_audio = torch.cat((content_audio, emotion_audio), dim=-1)
+        if raw_audio.shape[-1] != self.raw_audio_dim:
+            raise RuntimeError(
+                f"Audio2Face produced {raw_audio.shape[-1]} audio features; "
+                f"expected {self.raw_audio_dim}"
+            )
+
+        speaker_features = None
+        if self.speaker_embedding is not None:
+            speaker_features = self.speaker_embedding(speaker_labels[:, 0])
+            speaker_features = speaker_features.unsqueeze(1).expand(-1, time_steps, -1)
+
+        emotion_features = self.emotion_embedding(emotion_labels)
+        emotion_features = self.emotion_embedding_tail(
+            emotion_features.transpose(1, 2)
+        ).transpose(1, 2)
+
+        text_features = None
+        if self.text_encoder is not None:
+            text_features, _ = self.text_encoder(token_ids)
+            text_features = self._align_time(text_features, time_steps, "text features")
+
+        audio_parts = [raw_audio]
+        if text_features is not None:
+            audio_parts.append(text_features)
+        audio_parts.append(emotion_features)
+        if speaker_features is not None:
+            audio_parts.append(speaker_features)
+        audio_fusion_input = torch.cat(audio_parts, dim=-1)
+        if audio_fusion_input.shape[-1] != self.audio_fusion_input_dim:
+            raise RuntimeError(
+                f"Audio fusion dim mismatch: expected {self.audio_fusion_input_dim}, "
+                f"got {audio_fusion_input.shape[-1]}"
+            )
+        audio_features = self.audio_fusion(audio_fusion_input)
+
+        face_features = self.facial_encoder(predicted_face.transpose(1, 2)).transpose(1, 2)
+        face_features = self._align_time(face_features, time_steps, "face features")
+        face_parts = [face_features, audio_features]
+        if text_features is not None:
+            face_parts.append(text_features)
+        face_parts.append(emotion_features)
+        if speaker_features is not None:
+            face_parts.append(speaker_features)
+        facial_fusion_input = torch.cat(face_parts, dim=-1)
+        if facial_fusion_input.shape[-1] != self.facial_fusion_input_dim:
+            raise RuntimeError(
+                f"Face fusion dim mismatch: expected {self.facial_fusion_input_dim}, "
+                f"got {facial_fusion_input.shape[-1]}"
+            )
+        face_features = self.facial_fusion(facial_fusion_input)
+
+        condition_parts = []
+        if speaker_features is not None:
+            condition_parts.append(speaker_features)
+        condition_parts.append(emotion_features)
+        if text_features is not None:
+            condition_parts.append(text_features)
+        condition_parts.extend((audio_features, face_features))
+        conditions = torch.cat(condition_parts, dim=-1)
+        if conditions.shape[-1] != self.condition_dim:
+            raise RuntimeError(
+                f"Condition dim mismatch: expected {self.condition_dim}, "
+                f"got {conditions.shape[-1]}"
+            )
+
+        fused_conditions, _ = self.feature_fusion_lstm(conditions)
+        fused_conditions = self.feature_fusion_head(fused_conditions)
+        return fused_conditions, speaker_features
+
+    def _decode_vq(self, context, recurrent, code_head, vqvae, name):
+        hidden, _ = recurrent(context)
+        hidden = self._sum_bidirectional(hidden, self.hidden_size)
+        frame_logits = code_head(hidden)
+        code_logits = F.adaptive_avg_pool1d(
+            frame_logits.transpose(1, 2), self.latent_steps
+        ).transpose(1, 2)
+
+        if self.training:
+            probabilities = F.softmax(code_logits / self.vq_temperature, dim=-1)
+            indices = probabilities.argmax(dim=-1)
+            hard_codes = F.one_hot(
+                indices, num_classes=vqvae.num_embeddings
+            ).to(probabilities.dtype)
+            assignments = hard_codes + probabilities - probabilities.detach()
+            quantized = torch.matmul(assignments, vqvae.vq_layer.embeddings)
+        else:
+            indices = code_logits.argmax(dim=-1)
+            quantized = F.embedding(indices, vqvae.vq_layer.embeddings)
+
+        decoded, _ = vqvae.decoder(quantized.transpose(1, 2).contiguous())
+        decoded = decoded.transpose(1, 2).contiguous()
+        expected_shape = (context.shape[0], context.shape[1], vqvae.in_dim)
+        if tuple(decoded.shape) != expected_shape:
+            raise RuntimeError(
+                f"{name} VQ decoder produced {tuple(decoded.shape)}, "
+                f"expected {expected_shape}"
+            )
+        return decoded
+
+    @staticmethod
+    def _merge_body_and_hands(body, hands):
+        if body.shape[-1] != BODY_DIMS or hands.shape[-1] != HAND_DIMS:
+            raise ValueError(
+                f"Expected body/hand dims {BODY_DIMS}/{HAND_DIMS}, "
+                f"got {body.shape[-1]}/{hands.shape[-1]}"
+            )
+        return torch.cat(
+            (
+                body[..., :18],
+                hands[..., :57],
+                body[..., 18:],
+                hands[..., 57:],
+            ),
+            dim=-1,
+        )
+
+    def forward(
+        self,
+        pre_seq,
+        in_audio=None,
+        in_facial=None,
+        in_pae=None,
+        in_text=None,
+        in_id=None,
+        in_emo=None,
+        in_pose=None,
+    ):
+        del in_facial, in_pose  # Kept in the signature for trainer compatibility.
+        expected_seed_shape = (self.pose_length, self.seed_dim)
+        if pre_seq.ndim != 3 or tuple(pre_seq.shape[1:]) != expected_seed_shape:
+            raise ValueError(
+                "pre_seq must have shape "
+                f"[B, {self.pose_length}, {self.seed_dim}], got {tuple(pre_seq.shape)}"
+            )
+        if in_pae is not None:
+            expected_pae_shape = (
+                pre_seq.shape[0],
+                self.pose_length,
+                self.phase_parameter_dim,
+            )
+            if tuple(in_pae.shape) != expected_pae_shape:
+                raise ValueError(
+                    f"in_pae must have shape {expected_pae_shape}, got {tuple(in_pae.shape)}"
+                )
+
+        for recurrent in (
+            self.feature_fusion_lstm,
+            self.body_lstm,
+            self.hand_lstm,
+            self.phase_lstm,
+        ):
+            recurrent.flatten_parameters()
+
+        fused_conditions, speaker_features = self._encode_conditions(
+            pre_seq, in_audio, in_text, in_id, in_emo
+        )
+        generator_context = torch.cat((pre_seq, fused_conditions), dim=-1)
+        if generator_context.shape[-1] != self.generator_context_dim:
+            raise RuntimeError(
+                f"Generator context dim mismatch: expected {self.generator_context_dim}, "
+                f"got {generator_context.shape[-1]}"
+            )
+
+        phase_hidden, _ = self.phase_lstm(generator_context)
+        phase_hidden = self._sum_bidirectional(phase_hidden, self.hidden_size)
+        predicted_pae = self.phase_head(phase_hidden)
+        phase_shift, frequency, amplitude, offset = predicted_pae.split(
+            self.phase_channels, dim=-1
+        )
+        periodic_descriptors = torch.cat((frequency, amplitude, offset), dim=-1)
+
+        # Body branches are parallel: neither branch consumes the other's output.
+        body_non_periodic = self._decode_vq(
+            generator_context,
+            self.body_lstm,
+            self.body_code_head,
+            self.body_vqvae,
+            "body",
+        )
+        body_periodic, _ = self.body_periodic(
+            torch.cat((generator_context, periodic_descriptors), dim=-1),
+            phase_shift,
+        )
+        body = body_non_periodic + body_periodic
+
+        # Both hand branches share the same body-conditioned context.
+        hand_context = torch.cat((generator_context, body), dim=-1)
+        hand_non_periodic = self._decode_vq(
+            hand_context,
+            self.hand_lstm,
+            self.hand_code_head,
+            self.hand_vqvae,
+            "hand",
+        )
+        hand_periodic, _ = self.hand_periodic(
+            torch.cat((hand_context, periodic_descriptors), dim=-1),
+            phase_shift,
+        )
+        hands = hand_non_periodic + hand_periodic
+
+        motion = self._merge_body_and_hands(body, hands)
+        if motion.shape[-1] != self.pose_dims:
+            raise RuntimeError(
+                f"Final pose dim mismatch: expected {self.pose_dims}, got {motion.shape[-1]}"
+            )
+        return motion, predicted_pae, speaker_features
+
+
 class ConvDiscriminator(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.input_size = args.pose_dims
-
         self.hidden_size = 64
         self.pre_conv = nn.Sequential(
-            nn.Conv1d(self.input_size, 16, 3),
+            nn.Conv1d(args.pose_dims, 16, 3),
             nn.BatchNorm1d(16),
-            nn.LeakyReLU(True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv1d(16, 8, 3),
             nn.BatchNorm1d(8),
-            nn.LeakyReLU(True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv1d(8, 8, 3),
         )
-
-        self.LSTM = nn.LSTM(8, hidden_size=self.hidden_size, num_layers=4, bidirectional=True,
-                          dropout=0.3, batch_first=True)
-        self.out = nn.Linear(self.hidden_size, 1)
-        self.out2 = nn.Linear(34-6, 1)
-       
-        self.do_flatten_parameters = False
-        if torch.cuda.device_count() > 1:
-            self.do_flatten_parameters = True
+        self.recurrent = nn.LSTM(
+            8,
+            hidden_size=self.hidden_size,
+            num_layers=4,
+            bidirectional=True,
+            dropout=0.3,
+            batch_first=True,
+        )
+        self.frame_output = nn.Linear(self.hidden_size, 1)
+        discriminator_steps = int(args.pose_length) - 6
+        if discriminator_steps <= 0:
+            raise ValueError("pose_length must be greater than 6")
+        self.sequence_output = nn.Linear(discriminator_steps, 1)
 
     def forward(self, poses):
-        if self.do_flatten_parameters:
-            self.LSTM.flatten_parameters()
-        poses = poses.transpose(1, 2)
-        feat = self.pre_conv(poses)
-        feat = feat.transpose(1, 2)
-        output, _ = self.LSTM(feat)
-        output = output[:, :, :self.hidden_size] + output[:, :, self.hidden_size:]  
-        batch_size = poses.shape[0]
-        output = output.contiguous().view(-1, output.shape[2])
-        output = self.out(output)  # apply linear to every output
-        output = output.view(batch_size, -1)
-        output = self.out2(output)
-        output = torch.sigmoid(output)
-        return output
+        self.recurrent.flatten_parameters()
+        features = self.pre_conv(poses.transpose(1, 2)).transpose(1, 2)
+        output, _ = self.recurrent(features)
+        output = output[..., : self.hidden_size] + output[..., self.hidden_size :]
+        output = self.frame_output(output).squeeze(-1)
+        return torch.sigmoid(self.sequence_output(output))
